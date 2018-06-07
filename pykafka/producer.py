@@ -379,14 +379,14 @@ class Producer(object):
         :param message: Message with valid `partition_id`, ready to be sent
         :type message: `pykafka.protocol.Message`
         """
-        success = False
-        while not success:
+        # There is a small window where the owned brokers are updated
+        # that need to be accounted for.
+        while True:
             leader_id = self._topic.partitions[message.partition_id].leader.id
-            if leader_id in self._owned_brokers:
-                self._owned_brokers[leader_id].enqueue(message)
-                success = True
-            else:
-                success = False
+            owned_broker = self._owned_brokers.get(leader_id)
+            if owned_broker and owned_broker.enqueue(message):
+                return
+            self._cluster.handler.sleep()
 
     def _send_request(self, message_batch, owned_broker):
         """Send the produce request to the broker and handle the response.
@@ -584,11 +584,14 @@ class OwnedBroker(object):
         """
         self._wait_for_slot_available()
         with self.lock:
+            if not self.running:
+                return False
             self.queue.appendleft(message)
             self.increment_messages_pending(1)
             if len(self.queue) >= self.producer._min_queued_messages:
                 if not self.flush_ready.is_set():
                     self.flush_ready.set()
+        return True
 
     def flush(self, linger_ms, max_request_size, release_pending=False, wait=True):
         """Pop messages from the end of the queue
@@ -614,7 +617,7 @@ class OwnedBroker(object):
             batch = []
             batch_size_in_bytes = 0
             while len(self.queue) > 0:
-                if not self.running:
+                if not self.running and wait:
                     return []
                 peeked_message = self.queue[-1]
 
@@ -653,7 +656,7 @@ class OwnedBroker(object):
                 self.increment_messages_pending(-1 * len(batch))
             if not self.slot_available.is_set():
                 self.slot_available.set()
-        if not self.running:
+        if not self.running and wait:
             return []
         return batch
 
